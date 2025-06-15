@@ -23,23 +23,56 @@ def get_densest_location(group):
     counts = group.groupby(["lat", "lon"]).size()
     return counts.idxmax()
 
-def cluster_points(geo_data: pd.DataFrame) -> pd.DataFrame:
-    coords =  geo_data[["lat", "lon"]]
+def cluster_points(geo_data: pd.DataFrame, basemap_area: BasemapArea, lat_bins=100, lon_bins=100) -> pd.DataFrame:
+    # using grid discretization and putting the points in the center
+    coords =  geo_data[["lat", "lon"]].to_numpy()
 
-    kms_per_radian = 6371.0088
-    base_eps_km = 100
+    lat_edges = np.linspace(basemap_area.bottom_left_lat_deg, basemap_area.upper_right_lat_deg, lat_bins + 1)
+    lon_edges = np.linspace(basemap_area.bottom_left_lon_deg, basemap_area.upper_right_lon_deg, lat_bins + 1)
 
-    db = DBSCAN(eps=base_eps_km / kms_per_radian, min_samples=1, metric="haversine")
-    geo_data["cluster"] = db.fit_predict(coords)
-    return geo_data
+    lat_idx = np.digitize(coords[:, 0], lat_edges) - 1
+    lon_idx = np.digitize(coords[:, 1], lon_edges) - 1
 
-def centers_magnitudes(clustered_geo_data: pd.DataFrame) -> pd.DataFrame:
+    mask_oob = (
+        (lat_idx >= 0) & (lat_idx < lat_bins) &
+        (lon_idx >= 0) & (lon_idx < lon_bins)
+    )
+
+    df = pd.DataFrame(
+        {"lat_idx": lat_idx[mask_oob],
+         "lon_idx": lon_idx[mask_oob],
+         "lat": coords[mask_oob][:, 0],
+         "lon": coords[mask_oob][:, 1]
+        }
+    )
+
+    lat_lon_without_dupes = df.drop_duplicates(subset=["lat_idx", "lon_idx"],
+                                               keep="first")[["lat_idx", "lon_idx"]].values
+
+    # create a mapping
+    mapping ={tuple(k): v for k, v in zip(lat_lon_without_dupes,
+                                          np.arange(0, lat_lon_without_dupes.shape[0], 1))}
+
+    df["cluster"] = df.set_index(["lat_idx", "lon_idx"]).index.map(mapping)
+
+    # kms_per_radian = 6371.0088
+    # base_eps_km = 500
+
+    # db = DBSCAN(eps=base_eps_km / kms_per_radian, min_samples=1, metric="haversine")
+    # geo_data["cluster"] = db.fit_predict(coords)
+
+    return df
+
+def map_centers_sizes(clustered_geo_data: pd.DataFrame) -> pd.DataFrame:
     cluster_sizes  = clustered_geo_data.groupby("cluster").size()
     # find for each cluster, one entry that contains the most occurences (lat, long)-wise
     centers = clustered_geo_data.swifter.groupby("cluster").apply(get_densest_location)
 
+    lats, lons = tuple(zip(*centers.values))
+
     # create new dataframe containing the cluster centers and magnitudes
-    center_magnitudes = pd.DataFrame({"lat": centers[0][0], "lon": centers[0][0], "size": cluster_sizes.values, "cluster_id": cluster_sizes.index})
+    center_magnitudes = pd.DataFrame({"lat": np.array(lats), "lon": np.array(lons), "size": cluster_sizes.values, "cluster_id": cluster_sizes.index})
+    cm.logger.debug(center_magnitudes)
     return center_magnitudes
 
 def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
@@ -48,6 +81,7 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
                              save_path: Path,
                              basemap_area: BasemapArea,
                              date: cm.DataDate):
+
     # Drop rows with missing or zero coordinates
     geo_df = geoloc_manycast_df[(geoloc_manycast_df["lat"] != 0.0) & (geoloc_manycast_df["lon"] != 0.0)]
     cm.logger.info(f"Dropped {len(geoloc_manycast_df) - len(geo_df)} from being plotted (due to (lat, long) == (0, 0))")
@@ -55,8 +89,15 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
     # tx_sender should get handled on csv read, only show hosts, which packets get received aat madrid
     geo_df_madrid = geo_df[geo_df["receiver"] == rx_worker_name]
 
+    # retrieve clusters
+    clustered_df = cluster_points(geo_df_madrid, basemap_area, lat_bins=20, lon_bins=20)
+    centers_sizes = map_centers_sizes(clustered_df)
+
+    # get amount of clusters, where size==1
+    cm.logger.debug(f"Amount of clusters, where size == 1: {len(centers_sizes[centers_sizes["size"] == 1])}")
+
     # Set up figure
-    plt.figure(figsize=(15, 10))
+    fig, ax = plt.subplots(figsize=(15, 10))
 
     # Initialize Basemap
     # TODO: put basemapconstraints into this
@@ -65,7 +106,8 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
                 urcrnrlat=basemap_area.upper_right_lat_deg,
                 llcrnrlon=basemap_area.bottom_left_lon_deg,
                 urcrnrlon=basemap_area.upper_right_lon_deg,
-                resolution='l')
+                resolution='i',
+                ax=ax)
 
     # Draw map details
     m.drawcoastlines()
@@ -74,31 +116,55 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
     m.fillcontinents(color='white', lake_color='lightblue')
 
     # Group by (lat, lon) and count occurrences
-    location_counts = geo_df_madrid.groupby(["lat", "lon"]).size().reset_index(name='count')
+    # location_counts = geo_df_madrid.groupby(["lat", "lon"]).size().reset_index(name='count')
 
-    lats = location_counts["lat"].values
-    lons = location_counts["lon"].values
-    counts = np.sort(location_counts["count"].values)
+    # lats = location_counts["lat"].values
+    # lons = location_counts["lon"].values
+    # counts = np.sort(location_counts["count"].values)
 
-    sizes = np.round(counts, decimals=0)
+    # sizes = np.round(counts, decimals=0)
+    counts = centers_sizes["size"].values
 
     # take the 95 percentile as the maximum color value
     vmax = np.percentile(counts, 95)
+    vmin = 10
+    # vmax = np.max(counts)
+    cm.logger.debug(centers_sizes)
 
-    x, y = m(lons, lats)
-    sc = m.scatter(x,
-                   y,
-                   c=counts,
-                   cmap="viridis",
-                   s=sizes,
-                   alpha=0.6,
-                   edgecolors='none',
-                   norm=mplcolors.Normalize(vmin=1, vmax=vmax))
+    x, y = m(centers_sizes["lon"].values, centers_sizes["lat"])
 
-    plt.colorbar(sc, label="Frequency")
-    plt.title(f"Geolocation of Targets replying to {rx_worker_pretty}")
-    plt.xlabel(f"Anycast data from Frankfurt (src) and {rx_worker_pretty} (dst) from the {date}")
-    plt.savefig(save_path, format="pdf", bbox_inches="tight")
+    # filter rows by sizes
+    x_big = x[counts >= 800]
+    y_big = y[counts >= 800]
+
+    # scatter center points
+    ax.scatter(x_big,
+               y_big,
+               c="red",
+               s=10,
+               alpha=1,
+               marker="o",
+               edgecolors='none',
+               zorder=6)
+
+    # make sure counts for size is atleast vmin big
+    counts[counts < vmin] = vmin
+
+    sc = ax.scatter(x,
+                    y,
+                    c=counts,
+                    cmap="viridis",
+                    s=counts,
+                    alpha=0.6,
+                    marker="o",
+                    edgecolors='none',
+                    norm=mplcolors.Normalize(vmin=1, vmax=vmax),
+                    zorder=5)
+
+    fig.colorbar(sc, label="Frequency")
+    ax.set_title(f"Geolocation of Targets replying to {rx_worker_pretty}")
+    ax.set_xlabel(f"Anycast data from Frankfurt (src) and {rx_worker_pretty} (dst) from the {date}")
+    fig.savefig(save_path, format="pdf", bbox_inches="tight")
 
 def main():
     logging.config.dictConfig(config=cm.logging_config)
@@ -130,8 +196,8 @@ def main():
     manycast_file = next(cm.download_minio_file(bucket, data_dir, date))
 
     # for testing limit the number of rows
-    manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast", nrows_to_read=1_000_000) 
-    # manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast")
+    # manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast", nrows_to_read=1_000_000) 
+    manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast")
 
     cm.logger.debug(f"{manycast_df}")
     cm.logger.debug(meta_inf)
@@ -147,16 +213,6 @@ def main():
     manycast_df = cm.get_manycast_geolocated(manycast_df, ip2geolocation_df)
 
     cm.logger.debug(manycast_df)
-
-
-    # retrieve clusters
-    clustered_df = cluster_points(manycast_df)
-    centers_mags = centers_magnitudes(clustered_df)
-
-    cm.logger.debug(centers_mags)
-
-    # get amount of clusters, where size==1
-    cm.logger.debug(f"Amount of clusters, where size == 1: {len(centers_mags[centers_mags["size"] == 1])}")
 
     # check for amount of "same" targets [304] maximum at 2025-04-28
     # cm.logger.debug(manycast_df.value_counts(["target"]))

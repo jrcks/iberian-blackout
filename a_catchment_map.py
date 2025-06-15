@@ -4,11 +4,13 @@ from dataclasses import dataclass
 import logging.config
 import commons as cm
 
-import numpy as np
 import pandas as pd
+import swifter
+import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.basemap import Basemap
 import matplotlib.colors as mplcolors
+from sklearn.cluster import DBSCAN
 
 @dataclass(frozen=True, slots=True)
 class BasemapArea:
@@ -16,6 +18,29 @@ class BasemapArea:
     bottom_left_lon_deg: float
     upper_right_lat_deg: float
     upper_right_lon_deg: float
+
+def get_densest_location(group):
+    counts = group.groupby(["lat", "lon"]).size()
+    return counts.idxmax()
+
+def cluster_points(geo_data: pd.DataFrame) -> pd.DataFrame:
+    coords =  geo_data[["lat", "lon"]]
+
+    kms_per_radian = 6371.0088
+    base_eps_km = 100
+
+    db = DBSCAN(eps=base_eps_km / kms_per_radian, min_samples=1, metric="haversine")
+    geo_data["cluster"] = db.fit_predict(coords)
+    return geo_data
+
+def centers_magnitudes(clustered_geo_data: pd.DataFrame) -> pd.DataFrame:
+    cluster_sizes  = clustered_geo_data.groupby("cluster").size()
+    # find for each cluster, one entry that contains the most occurences (lat, long)-wise
+    centers = clustered_geo_data.swifter.groupby("cluster").apply(get_densest_location)
+
+    # create new dataframe containing the cluster centers and magnitudes
+    center_magnitudes = pd.DataFrame({"lat": centers[0][0], "lon": centers[0][0], "size": cluster_sizes.values, "cluster_id": cluster_sizes.index})
+    return center_magnitudes
 
 def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
                              rx_worker_name: str,
@@ -25,6 +50,7 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
                              date: cm.DataDate):
     # Drop rows with missing or zero coordinates
     geo_df = geoloc_manycast_df[(geoloc_manycast_df["lat"] != 0.0) & (geoloc_manycast_df["lon"] != 0.0)]
+    cm.logger.info(f"Dropped {len(geoloc_manycast_df) - len(geo_df)} from being plotted (due to (lat, long) == (0, 0))")
 
     # tx_sender should get handled on csv read, only show hosts, which packets get received aat madrid
     geo_df_madrid = geo_df[geo_df["receiver"] == rx_worker_name]
@@ -52,12 +78,13 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
 
     lats = location_counts["lat"].values
     lons = location_counts["lon"].values
-    counts = location_counts["count"].values
+    counts = np.sort(location_counts["count"].values)
 
-    sizes = 10 * counts
-    # TODO: improve this for semantic understanding 
-    # (as excluding the upper counts is not really a good solution)
-    vmax = np.percentile(counts, 99)
+    sizes = np.round(counts, decimals=0)
+
+    # take the 95 percentile as the maximum color value
+    vmax = np.percentile(counts, 95)
+
     x, y = m(lons, lats)
     sc = m.scatter(x,
                    y,
@@ -120,6 +147,21 @@ def main():
     manycast_df = cm.get_manycast_geolocated(manycast_df, ip2geolocation_df)
 
     cm.logger.debug(manycast_df)
+
+
+    # retrieve clusters
+    clustered_df = cluster_points(manycast_df)
+    centers_mags = centers_magnitudes(clustered_df)
+
+    cm.logger.debug(centers_mags)
+
+    # get amount of clusters, where size==1
+    cm.logger.debug(f"Amount of clusters, where size == 1: {len(centers_mags[centers_mags["size"] == 1])}")
+
+    # check for amount of "same" targets [304] maximum at 2025-04-28
+    # cm.logger.debug(manycast_df.value_counts(["target"]))
+    # cm.logger.debug(manycast_df.value_counts(["encoded_target_addr"]))
+    # cm.logger.debug(manycast_df.value_counts(["probe_dst_addr"]))
 
     plot_target_geolocations(manycast_df,
                              "es-mad-manycast",

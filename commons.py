@@ -217,7 +217,7 @@ def process_chunk(
     chunk['rtt'] = (chunk['rx_time'] - chunk['tx_time']) / 1e6
 
     # Return only the needed columns
-    return chunk[['receiver', 'sender', 'target', 'reply_src_addr',  'rtt', 'ttl']]
+    return chunk[['receiver', 'sender', 'target', 'reply_src_addr', 'probe_dst_addr', 'rtt', 'ttl']]
 
 def csv_to_df(
     filepath: str,
@@ -251,11 +251,12 @@ def csv_to_df(
         filepath,
         compression='gzip',
         comment='#',
-        usecols=['rx_worker_id', 'tx_worker_id', 'reply_src_addr', 'rx_time', 'tx_time', 'ttl'],
+        usecols=['rx_worker_id', 'tx_worker_id', 'reply_src_addr', 'probe_dst_addr', 'rx_time', 'tx_time', 'ttl'],
         dtype={
             'rx_worker_id': 'uint8',
             'tx_worker_id': 'uint8',
             'reply_src_addr': 'uint32',
+            'probe_dst_addr': 'uint32',
             'rx_time': 'float64',
             'tx_time': 'float64',
             'ttl': 'uint8'

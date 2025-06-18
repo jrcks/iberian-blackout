@@ -1,5 +1,5 @@
 # imports
-from typing import Generator
+from typing import Generator, override
 from pathlib import Path
 import os
 import gzip
@@ -8,6 +8,8 @@ import ipaddress
 import zipfile
 import logging
 import time
+
+from datetime import date
 
 import requests
 import pandas as pd
@@ -53,8 +55,13 @@ class DataDate:
     year: int
     month: int
     day: int
+
     def __repr__(self) -> str:
         return f"{self.year:04d}-{self.month:02d}-{self.day:02d}"
+
+    @override
+    def __str__(self) -> str:
+        return date.fromisoformat(self.__repr__()).strftime("%d. %B %Y")
 
 # load environment variables from .env
 def load_env_file(env_file: Path):

@@ -52,14 +52,13 @@ def cluster_points(geo_data: pd.DataFrame, basemap_area: BasemapArea, lat_bins=2
         }
     )
 
-    lat_lon_without_dupes = df.drop_duplicates(subset=["lat_idx", "lon_idx"],
-                                               keep="first")[["lat_idx", "lon_idx"]].values
+    # lat_lon_without_dupes = df.drop_duplicates(subset=["lat_idx", "lon_idx"],
+    #                                            keep="first")[["lat_idx", "lon_idx"]].values
 
-    # create a mapping
-    mapping ={tuple(k): v for k, v in zip(lat_lon_without_dupes,
-                                          np.arange(0, lat_lon_without_dupes.shape[0], 1))}
+    # # create a mapping, which essentially assigns an id based on the lat_idx and lon_idx
+    # mapping ={tuple(k): v for k, v in zip(lat_lon_without_dupes, lat_idx + lat_bins * lon_idx)}
 
-    df["cluster"] = df.set_index(["lat_idx", "lon_idx"]).index.map(mapping)
+    df["cluster"] = df.set_index(["lat_idx", "lon_idx"]).index.map(lambda x: x[0] + lat_bins * x[1])
 
     # DBSCAN approach
     # kms_per_radian = 6371.0088
@@ -81,19 +80,15 @@ def map_centers_sizes(clustered_geo_data: pd.DataFrame) -> pd.DataFrame:
     cm.logger.debug(center_magnitudes)
     return center_magnitudes
 
-def plot_target_geoloc_circles(geoloc_manycast_df: pd.DataFrame,
-                               rx_worker_name: str,
-                               rx_worker_pretty: str,
-                               save_path: Path,
-                               basemap_area: BasemapArea,
-                               date: cm.DataDate,
-                               lat_bins=20,
-                               lon_bins=20,
-                               big_thresh=800):
-
+def cluster_geoloc_data(geoloc_df: pd.DataFrame,
+                        basemap_area: BasemapArea,
+                        rx_worker_name: str,
+                        lat_bins=20,
+                        lon_bins=20,
+                        ):
     # Drop rows with missing or zero coordinates
-    geo_df = geoloc_manycast_df[(geoloc_manycast_df["lat"] != 0.0) & (geoloc_manycast_df["lon"] != 0.0)]
-    cm.logger.info(f"Dropped {len(geoloc_manycast_df) - len(geo_df)} from being plotted (due to (lat, long) == (0, 0))")
+    geo_df = geoloc_df[(geoloc_df["lat"] != 0.0) & (geoloc_df["lon"] != 0.0)]
+    cm.logger.info(f"Dropped {len(geoloc_df) - len(geo_df)} from being plotted (due to (lat, long) == (0, 0))")
 
     # tx_sender should get handled on csv read, only show hosts, which packets get received aat madrid
     geo_df_madrid = geo_df[geo_df["receiver"] == rx_worker_name]
@@ -104,6 +99,19 @@ def plot_target_geoloc_circles(geoloc_manycast_df: pd.DataFrame,
 
     # get amount of clusters, where size==1
     cm.logger.debug(f"Amount of clusters, where size == 1: {len(centers_sizes[centers_sizes["size"] == 1])}")
+
+    return centers_sizes, lat_edges, lon_edges
+
+def plot_target_geoloc_circles(centers_sizes: pd.DataFrame,
+                               basemap_area: BasemapArea,
+                               rx_worker_pretty: str,
+                               save_path: Path,
+                               date: cm.DataDate,
+                               lat_edges: npt.NDArray,
+                               lon_edges: npt.NDArray,
+                               big_thresh=800,
+                               vmax=None,
+                               vmin=None):
 
     # Set up figure
     fig, ax = plt.subplots(figsize=(15, 10))
@@ -126,19 +134,19 @@ def plot_target_geoloc_circles(geoloc_manycast_df: pd.DataFrame,
     # sizes = np.round(counts, decimals=0)
     counts = centers_sizes["size"].values
 
-    vmax = np.max(counts)
-    vmin = 10
+    if vmax is None:
+        vmax = np.max(counts)
+    if vmin is None:
+        vmin = np.min(counts)
 
     # vmax = np.max(counts)
     cm.logger.debug(centers_sizes)
 
     x, y = m(centers_sizes["lon"].values, centers_sizes["lat"])
 
-    upper_percentile = np.percentile(counts ,80)
-
     # filter rows by sizes
-    x_big = x[counts >= upper_percentile]
-    y_big = y[counts >= upper_percentile]
+    x_big = x[counts >= big_thresh]
+    y_big = y[counts >= big_thresh]
 
     # draw grid to indicate the "bins"
     for i in range(0, len(lat_edges) - 1):
@@ -174,7 +182,7 @@ def plot_target_geoloc_circles(geoloc_manycast_df: pd.DataFrame,
                     y,
                     c=counts,
                     cmap="viridis",
-                    s=counts,
+                    s=sizes,
                     alpha=0.6,
                     marker="o",
                     edgecolors='none',
@@ -185,6 +193,114 @@ def plot_target_geoloc_circles(geoloc_manycast_df: pd.DataFrame,
     ax.set_title(f"Geolocation of Targets replying to {rx_worker_pretty}")
     ax.set_xlabel(f"Anycast data from Frankfurt to {rx_worker_pretty} at {date}")
     fig.savefig(save_path, format="pdf", bbox_inches="tight")
+
+def calc_diff_in_clusters(big_centers_sizes: pd.DataFrame,
+                               small_centers_sizes: pd.DataFrame):
+    """
+    This will essentially calculate small vs big differences
+    """
+    center_sizes_merged = pd.merge(big_centers_sizes, small_centers_sizes, how="outer", on="cluster_id", suffixes=("_big", "_small"))
+    center_sizes_merged.fillna(0, inplace=True)
+    # calculate size_diff
+    center_sizes_merged["size_diff"] = center_sizes_merged["size_small"] - center_sizes_merged["size_big"]
+
+    return center_sizes_merged
+
+def plot_diff_geoloc_circles(diffed_centers_sizes: pd.DataFrame,
+                                  basemap_area: BasemapArea,
+                                  rx_worker_pretty: str,
+                                  save_path: Path,
+                                  date_big: cm.DataDate,
+                                  date_small: cm.DataDate,
+                                  big_lat_edges: npt.NDArray,
+                                  big_lon_edges: npt.NDArray,
+                                  big_thresh=100,
+                                  vmin=None,
+                                  vmax=None):
+    # Set up figure
+    fig, ax = plt.subplots(figsize=(15, 10))
+
+    # Initialize Basemap
+    m = Basemap(projection='merc',
+                llcrnrlat=basemap_area.bottom_left_lat_deg,
+                urcrnrlat=basemap_area.upper_right_lat_deg,
+                llcrnrlon=basemap_area.bottom_left_lon_deg,
+                urcrnrlon=basemap_area.upper_right_lon_deg,
+                resolution='l',
+                ax=ax)
+
+    # Draw map details
+    m.drawcoastlines()
+    m.drawcountries()
+    m.drawmapboundary(fill_color='lightblue')
+    m.fillcontinents(color='white', lake_color='lightblue')
+
+    # sizes = np.round(counts, decimals=0)
+    diffs = diffed_centers_sizes["size_diff"].values
+
+    cm.logger.debug(diffs)
+    if vmax is None:
+        vmax = np.max(diffs)
+    if vmin is None:
+        vmin = np.min(diffs)
+
+    # vmax = np.max(counts)
+    cm.logger.debug(diffed_centers_sizes)
+
+    x, y = m(diffed_centers_sizes["lon_big"].values, diffed_centers_sizes["lat_big"])
+
+    # filter rows by sizes
+    x_big = x[np.abs(diffs) >= big_thresh]
+    y_big = y[np.abs(diffs) >= big_thresh]
+
+    # draw grid to indicate the "bins"
+    for i in range(0, len(big_lat_edges) - 1):
+        for j in range(0, len(big_lon_edges) - 1):
+            lat0, lat1 = big_lat_edges[i], big_lat_edges[i + 1]
+            lon0, lon1 = big_lon_edges[j], big_lon_edges[j + 1]
+
+            x0, y0 = m(lon0, lat0)
+            x1, y1 = m(lon1, lat1)
+            width = x1 - x0
+            height = y1 - y0
+
+            rect = Rectangle((x0, y0), width, height,
+                            linewidth=.8, edgecolor="gray", linestyle="--", fill=False, facecolor=None, alpha=.4, zorder=7)
+            ax.add_patch(rect)
+
+
+    # scatter center points for big circles
+    ax.scatter(x_big,
+               y_big,
+               c="black",
+               s=10,
+               alpha=1,
+               marker="o",
+               edgecolors='none',
+               zorder=6)
+
+    # make sure counts for size is atleast 10 big otherwise the points cannot be seen on the map
+    sizes = np.abs(diffs)
+    sizes[sizes < 10] = 10
+    cm.logger.debug(f"{vmin}, {vmax}")
+
+    sc = ax.scatter(x,
+                    y,
+                    c=diffs,
+                    cmap="managua",
+                    s=sizes,
+                    alpha=0.6,
+                    marker="o",
+                    edgecolors='none',
+                    norm=mplcolors.SymLogNorm(10, vmin=vmin, vmax=vmax),
+                    zorder=5)
+
+    cax = fig.add_axes([ax.get_position().x1+0.01,ax.get_position().y0,0.02,ax.get_position().height])
+
+    fig.colorbar(sc, label="Frequency difference", cax=cax)
+    ax.set_title(f"Replying targets difference from {date_big} to {date_small}")
+    ax.set_xlabel(f"Anycast data from Frankfurt to {rx_worker_pretty}")
+    fig.savefig(save_path, bbox_inches="tight", dpi=400)
 
 def plotly_geocord_colors(geoloc_manycast_df: pd.DataFrame,
                           regions,
@@ -235,6 +351,25 @@ def plotly_geocord_colors(geoloc_manycast_df: pd.DataFrame,
     fig.write_image(save_path)
 
 def main():
+    analyze_days = [
+
+                    # cm.DataDate(2025, 4, 27),
+                    cm.DataDate(2025, 4, 28),
+                    cm.DataDate(2025, 4, 29),
+                    cm.DataDate(2025, 4, 30),
+                    cm.DataDate(2025, 5, 1),
+                    cm.DataDate(2025, 5, 2),
+                    cm.DataDate(2025, 5, 3)
+                    # ]
+    ]
+
+    # the assumed bigger one should always be first
+    analyze_combinations = [(0, 1), (1,2), (2,3), (3,4), (4,5)]
+
+    # analyze_days = set([cm.DataDate(2025, 4, 30)])
+
+    analyze_days_stats = {}
+
     logging.config.dictConfig(config=cm.logging_config)
 
     # prepare environment
@@ -244,7 +379,6 @@ def main():
     # lat=40.416775, long=-3.703790
 
     # define parameters
-    date = cm.DataDate(2025, 4, 28)
     basemap_area = BasemapArea(30, -20, 50, 20)
 
     # world map (almost world like in https://matplotlib.org/basemap/stable/users/merc.html)
@@ -263,43 +397,103 @@ def main():
     # process data
     bucket = cm.get_bucket()
 
-    # TODO: retrieve for multiple days
-    manycast_file = next(cm.download_minio_file(bucket, data_dir, date))
-
-    # for testing limit the number of rows
-    manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast", nrows_to_read=1_000_000) 
-    # manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast")
-
-    cm.logger.debug(f"{manycast_df}")
-    cm.logger.debug(meta_inf)
-
     # process ip2location db
     cm.download_ip2location_db(ip_geolocation_db_path, ip_geolocation_download_path, ip_geolocation_url)
     ip2geolocation_df = cm.preproc_ip2location(ip_geolocation_db_path)
 
-    # TODO: check logging context
-    lat0_lon0_amount = ((ip2geolocation_df["lon"] == 0.0) & (ip2geolocation_df["lat"] == 0.0)).sum()
-    cm.logger.debug(f"invalid lat long values found in ip2location database: {lat0_lon0_amount}")
+    vmin = None
+    vmax = None
 
-    manycast_df = cm.get_manycast_geolocated(manycast_df, ip2geolocation_df)
+    for date in analyze_days:
+        manycast_file = next(cm.download_minio_file(bucket, data_dir, date))
 
-    cm.logger.debug(manycast_df)
+        # for testing limit the number of rows
+        # manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast", nrows_to_read=1_000_000)
+        manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast")
 
-    # check for amount of "same" targets [304] maximum at 2025-04-28
-    # cm.logger.debug(manycast_df.value_counts(["target"]))
-    # cm.logger.debug(manycast_df.value_counts(["encoded_target_addr"]))
-    # cm.logger.debug(manycast_df.value_counts(["probe_dst_addr"]))
+        # cm.logger.debug(f"{manycast_df}")
+        # cm.logger.debug(meta_inf)
 
-    plot_target_geoloc_circles(manycast_df,
-                              "es-mad-manycast",
-                              "Madrid",
-                              results_path / f"fra-mad_{date}.pdf",
-                              basemap_area,
-                              date,
-                              lat_bins=16,
-                              lon_bins=24,
-                              big_thresh=800)
+        # TODO: check logging context
+        lat0_lon0_amount = ((ip2geolocation_df["lon"] == 0.0) & (ip2geolocation_df["lat"] == 0.0)).sum()
+        cm.logger.debug(f"invalid lat long values found in ip2location database: {lat0_lon0_amount}")
 
+        manycast_df = cm.get_manycast_geolocated(manycast_df, ip2geolocation_df)
+
+        cm.logger.debug(manycast_df)
+
+        centers_sizes, lat_edges, lon_edges = cluster_geoloc_data(manycast_df,
+                                                                  basemap_area,
+                                                                  "es-mad-manycast",
+                                                                  lat_bins=16,
+                                                                  lon_bins=24)
+
+        # save the stats for each date
+        analyze_days_stats[date] = (centers_sizes, lat_edges, lon_edges)
+
+        counts = centers_sizes["size"].values
+        max_cnt = np.max(counts)
+        min_cnt = np.min(counts)
+
+        if vmin is None or vmin > min_cnt:
+            vmin = min_cnt
+        if vmax is None or vmax < max_cnt:
+            vmax = max_cnt
+
+    # now create a plot for each date but determine vmax beforehand
+    for date, (centers_sizes, lat_edges, lon_edges) in analyze_days_stats.items():
+        plot_target_geoloc_circles(centers_sizes,
+                                   basemap_area,
+                                   "Madrid",
+                                   results_path / f"fra-mad_{repr(date)}.pdf",
+                                   date,
+                                   lat_edges,
+                                   lon_edges,
+                                   big_thresh=800,
+                                   vmin=vmin,
+                                   vmax=vmax)
+
+
+    big_lat_edges = None
+    big_lon_edges = None
+
+    sizes_list = []
+
+    vmin = None
+    vmax = None
+
+    for idx0, idx1 in analyze_combinations:
+        date_big = analyze_days[idx0]
+        date_small = analyze_days[idx1]
+        centers_big, big_lat_edges, big_lon_edges = analyze_days_stats[date_big]
+        centers_small, _, _ = analyze_days_stats[date_small]
+
+        centers_diffs = calc_diff_in_clusters(centers_big, centers_small)
+
+        max_cnt = np.max(centers_diffs)
+        min_cnt = np.min(centers_diffs)
+
+        if vmin is None or vmin > min_cnt:
+            vmin = min_cnt
+        if vmax is None or vmax < max_cnt:
+            vmax = max_cnt
+
+        sizes_list.append(centers_diffs)
+
+    for (idx0, idx1), size_diffs in zip(analyze_combinations, sizes_list):
+        date_big = analyze_days[idx0]
+        date_small = analyze_days[idx1]
+        plot_diff_geoloc_circles(size_diffs,
+                                      basemap_area,
+                                      "Madrid",
+                                      results_path / f"fra-mad_{repr(date_big)}_to_{repr(date_small)}.png",
+                                      date_big,
+                                      date_small,
+                                      big_lat_edges,
+                                      big_lon_edges,
+                                      big_thresh=500,
+                                      vmin=vmin,
+                                      vmax=vmax)
 
 
     # Load a GeoDataFrame with regional boundaries (e.g., US states, world countries)

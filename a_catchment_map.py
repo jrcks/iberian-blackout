@@ -14,6 +14,10 @@ import matplotlib.colors as mplcolors
 from matplotlib.patches import Rectangle
 from sklearn.cluster import DBSCAN
 
+import geopandas as gpd
+import plotly.express as px
+from shapely.geometry import Point, box
+
 @dataclass(frozen=True, slots=True)
 class BasemapArea:
     bottom_left_lat_deg: float | None = None
@@ -77,16 +81,15 @@ def map_centers_sizes(clustered_geo_data: pd.DataFrame) -> pd.DataFrame:
     cm.logger.debug(center_magnitudes)
     return center_magnitudes
 
-def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
-                             rx_worker_name: str,
-                             rx_worker_pretty: str,
-                             save_path: Path,
-                             basemap_area: BasemapArea,
-                             date: cm.DataDate,
-                             lat_bins=20,
-                             lon_bins=20,
-                             log_scale=1,
-                             ):
+def plot_target_geoloc_circles(geoloc_manycast_df: pd.DataFrame,
+                               rx_worker_name: str,
+                               rx_worker_pretty: str,
+                               save_path: Path,
+                               basemap_area: BasemapArea,
+                               date: cm.DataDate,
+                               lat_bins=20,
+                               lon_bins=20,
+                               big_thresh=800):
 
     # Drop rows with missing or zero coordinates
     geo_df = geoloc_manycast_df[(geoloc_manycast_df["lat"] != 0.0) & (geoloc_manycast_df["lon"] != 0.0)]
@@ -106,7 +109,6 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
     fig, ax = plt.subplots(figsize=(15, 10))
 
     # Initialize Basemap
-    # TODO: put basemapconstraints into this
     m = Basemap(projection='merc',
                 llcrnrlat=basemap_area.bottom_left_lat_deg,
                 urcrnrlat=basemap_area.upper_right_lat_deg,
@@ -121,19 +123,10 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
     m.drawmapboundary(fill_color='lightblue')
     m.fillcontinents(color='white', lake_color='lightblue')
 
-    # Group by (lat, lon) and count occurrences
-    # location_counts = geo_df_madrid.groupby(["lat", "lon"]).size().reset_index(name='count')
-
-    # lats = location_counts["lat"].values
-    # lons = location_counts["lon"].values
-    # counts = np.sort(location_counts["count"].values)
-
     # sizes = np.round(counts, decimals=0)
     counts = centers_sizes["size"].values
 
-    # take the 95 percentile as the maximum color value
-    vmax = np.percentile(counts, 95)
-
+    vmax = np.max(counts)
     vmin = 10
 
     # vmax = np.max(counts)
@@ -141,9 +134,11 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
 
     x, y = m(centers_sizes["lon"].values, centers_sizes["lat"])
 
+    upper_percentile = np.percentile(counts ,80)
+
     # filter rows by sizes
-    x_big = x[counts >= 800]
-    y_big = y[counts >= 800]
+    x_big = x[counts >= upper_percentile]
+    y_big = y[counts >= upper_percentile]
 
     # draw grid to indicate the "bins"
     for i in range(0, len(lat_edges) - 1):
@@ -161,7 +156,7 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
             ax.add_patch(rect)
 
 
-    # scatter center points
+    # scatter center points for big circles
     ax.scatter(x_big,
                y_big,
                c="red",
@@ -171,24 +166,73 @@ def plot_target_geolocations(geoloc_manycast_df: pd.DataFrame,
                edgecolors='none',
                zorder=6)
 
-    # make sure counts for size is atleast vmin big
-    counts[counts < vmin] = vmin
+    # make sure counts for size is atleast 10 big
+    sizes = counts
+    sizes[counts < 10] = 10
 
     sc = ax.scatter(x,
                     y,
                     c=counts,
                     cmap="viridis",
-                    s=np.emath.logn(log_scale, counts),
+                    s=counts,
                     alpha=0.6,
                     marker="o",
                     edgecolors='none',
-                    norm=mplcolors.Normalize(vmin=1, vmax=vmax),
+                    norm=mplcolors.LogNorm(vmin=vmin, vmax=vmax),
                     zorder=5)
 
     fig.colorbar(sc, label="Frequency")
     ax.set_title(f"Geolocation of Targets replying to {rx_worker_pretty}")
-    ax.set_xlabel(f"Anycast data from Frankfurt (src) and {rx_worker_pretty} (dst) from the {date}")
+    ax.set_xlabel(f"Anycast data from Frankfurt to {rx_worker_pretty} at {date}")
     fig.savefig(save_path, format="pdf", bbox_inches="tight")
+
+def plotly_geocord_colors(geoloc_manycast_df: pd.DataFrame,
+                          regions,
+                          rx_worker_name: str,
+                          save_path: Path,
+                          basemap_area: BasemapArea):
+
+    # Drop rows with missing or zero coordinates
+    geo_df = geoloc_manycast_df[(geoloc_manycast_df["lat"] != 0.0) & (geoloc_manycast_df["lon"] != 0.0)]
+    cm.logger.info(f"Dropped {len(geoloc_manycast_df) - len(geo_df)} from being plotted (due to (lat, long) == (0, 0))")
+
+    # tx_sender should get handled on csv read, only show hosts, which packets get received aat madrid
+    geo_df_madrid = geo_df[geo_df["receiver"] == rx_worker_name]
+    cm.logger.debug(geo_df_madrid)
+
+    # Create GeoDataFrame from the input coordinates
+    geometry = [Point(xy) for xy in zip(geo_df_madrid['lon'], geo_df_madrid['lat'])]
+    gdf_points = gpd.GeoDataFrame(geo_df_madrid, geometry=geometry, crs=regions.crs)
+
+    bbox = box(basemap_area.bottom_left_lon_deg, basemap_area.bottom_left_lat_deg, basemap_area.upper_right_lon_deg, basemap_area.upper_right_lat_deg)
+
+    regions = regions[regions.intersects(bbox)]
+
+    # Spatial join to assign each point to a region
+    joined = gpd.sjoin(gdf_points, regions, how='left', predicate='within')
+    cm.logger.debug(joined)
+
+    # simplify regions
+    # regions["geometry"] = regions["geometry"].simplify(tolerance=0.001)
+    # cm.logger.debug(regions)
+
+    # Count points per region (using 'name' for country names)
+    counts = joined.groupby('shapeID').size().reset_index(name='count')
+
+    # Merge counts with regions
+    regions_counts = regions.merge(counts, on='shapeID', how='left').fillna({'count': 0})
+    cm.logger.debug(regions_counts)
+
+    # Plot Choropleth using Plotly
+    fig = px.choropleth(regions_counts,
+                        geojson=regions_counts.geometry,
+                        locations=regions_counts.index,
+                        projection="natural earth")
+
+    fig.update_geos(fitbounds="locations", visible=False)
+    fig.update_layout(title='Coordinate Count by Region')
+    # fig.write_html(save_path)
+    fig.write_image(save_path)
 
 def main():
     logging.config.dictConfig(config=cm.logging_config)
@@ -223,8 +267,8 @@ def main():
     manycast_file = next(cm.download_minio_file(bucket, data_dir, date))
 
     # for testing limit the number of rows
-    # manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast", nrows_to_read=1_000_000) 
-    manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast")
+    manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast", nrows_to_read=1_000_000) 
+    # manycast_df, meta_inf = cm.preproc_network_data(manycast_file, "de-fra-manycast")
 
     cm.logger.debug(f"{manycast_df}")
     cm.logger.debug(meta_inf)
@@ -246,14 +290,23 @@ def main():
     # cm.logger.debug(manycast_df.value_counts(["encoded_target_addr"]))
     # cm.logger.debug(manycast_df.value_counts(["probe_dst_addr"]))
 
-    plot_target_geolocations(manycast_df,
-                             "es-mad-manycast",
-                             "Madrid (Spain)",
-                             results_path / f"fra-mad_{date}.pdf",
-                             basemap_area,
-                             date,
-                             lat_bins=100,
-                             lon_bins=200)
+    plot_target_geoloc_circles(manycast_df,
+                              "es-mad-manycast",
+                              "Madrid",
+                              results_path / f"fra-mad_{date}.pdf",
+                              basemap_area,
+                              date,
+                              lat_bins=16,
+                              lon_bins=24,
+                              big_thresh=800)
+
+
+
+    # Load a GeoDataFrame with regional boundaries (e.g., US states, world countries)
+    # For global countries:
+    # regions = gpd.read_file(data_dir / "geoBoundariesCGAZ_ADM2.geojson")
+
+    # plotly_geocord_colors(manycast_df, regions, "es-mad-manycast", results_path / f"fra-mad_plotly_{date}.pdf", basemap_area)
 
 if __name__ == "__main__":
     main()

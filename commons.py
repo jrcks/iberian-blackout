@@ -321,6 +321,9 @@ def preproc_network_data(manycast_data_path: Path, tx_worker_name: str | None = 
     # make huebsch
     network_df = network_df.rename(columns={"reply_src_addr": "encoded_target_addr"})
 
+    # make sure to exclude lines containing the target multiple times
+    network_df.drop_duplicates(subset=['receiver', 'sender', 'target'], keep='first', inplace=True)
+
     return network_df, comment_lines
 
 def preproc_ip2location(ip_geoloc_db: Path) -> pd.DataFrame:

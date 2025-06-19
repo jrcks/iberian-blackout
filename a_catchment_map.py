@@ -1,3 +1,4 @@
+from typing import Callable
 from pathlib import Path
 import os
 from dataclasses import dataclass
@@ -110,6 +111,7 @@ def plot_target_geoloc_circles(centers_sizes: pd.DataFrame,
                                lat_edges: npt.NDArray,
                                lon_edges: npt.NDArray,
                                big_thresh=800,
+                               size_modifier_func: Callable | None=None,
                                vmax=None,
                                vmin=None):
 
@@ -189,34 +191,35 @@ def plot_target_geoloc_circles(centers_sizes: pd.DataFrame,
                     norm=mplcolors.LogNorm(vmin=vmin, vmax=vmax),
                     zorder=5)
 
-    fig.colorbar(sc, label="Frequency")
-    ax.set_title(f"Geolocation of Targets replying to {rx_worker_pretty}")
-    ax.set_xlabel(f"Anycast data from Frankfurt to {rx_worker_pretty} at {date}")
-    fig.savefig(save_path, format="pdf", bbox_inches="tight")
+    cbar = fig.colorbar(sc, label="Frequency")
+    cbar.ax.tick_params(labelsize = 16)
+    ax.set_title(f"Geolocation of Targets replying to {rx_worker_pretty}", fontsize=20)
+    ax.set_ylabel(f"Anycast data from Frankfurt to {rx_worker_pretty} at {date}", fontsize=16)
+    fig.savefig(save_path, bbox_inches="tight", dpi=400)
 
-def calc_diff_in_clusters(big_centers_sizes: pd.DataFrame,
-                               small_centers_sizes: pd.DataFrame):
+def calc_diff_in_clusters(from_centers_sizes: pd.DataFrame,
+                          to_centers_sizes: pd.DataFrame):
     """
     This will essentially calculate small vs big differences
     """
-    center_sizes_merged = pd.merge(big_centers_sizes, small_centers_sizes, how="outer", on="cluster_id", suffixes=("_big", "_small"))
+    center_sizes_merged = pd.merge(from_centers_sizes, to_centers_sizes, how="outer", on="cluster_id", suffixes=("_from", "_to"))
     center_sizes_merged.fillna(0, inplace=True)
     # calculate size_diff
-    center_sizes_merged["size_diff"] = center_sizes_merged["size_small"] - center_sizes_merged["size_big"]
+    center_sizes_merged["size_diff"] = center_sizes_merged["size_to"] - center_sizes_merged["size_from"]
 
     return center_sizes_merged
 
 def plot_diff_geoloc_circles(diffed_centers_sizes: pd.DataFrame,
-                                  basemap_area: BasemapArea,
-                                  rx_worker_pretty: str,
-                                  save_path: Path,
-                                  date_big: cm.DataDate,
-                                  date_small: cm.DataDate,
-                                  big_lat_edges: npt.NDArray,
-                                  big_lon_edges: npt.NDArray,
-                                  big_thresh=100,
-                                  vmin=None,
-                                  vmax=None):
+                             basemap_area: BasemapArea,
+                             rx_worker_pretty: str,
+                             save_path: Path,
+                             date_from: cm.DataDate,
+                             date_to: cm.DataDate,
+                             lat_edges: npt.NDArray,
+                             lon_edges: npt.NDArray,
+                             big_thresh=100,
+                             vmin=None,
+                             vmax=None):
     # Set up figure
     fig, ax = plt.subplots(figsize=(15, 10))
 
@@ -247,17 +250,23 @@ def plot_diff_geoloc_circles(diffed_centers_sizes: pd.DataFrame,
     # vmax = np.max(counts)
     cm.logger.debug(diffed_centers_sizes)
 
-    x, y = m(diffed_centers_sizes["lon_big"].values, diffed_centers_sizes["lat_big"])
+
+    big_mask = diffed_centers_sizes["size_from"] >= diffed_centers_sizes["size_to"]
+    # take the biggest cluster for lon
+    lon_big = np.where(big_mask, diffed_centers_sizes["lon_from"], diffed_centers_sizes["lon_to"])
+    lat_big = np.where(big_mask, diffed_centers_sizes["lat_from"], diffed_centers_sizes["lat_to"])
+
+    x, y = m(lon_big, lat_big)
 
     # filter rows by sizes
     x_big = x[np.abs(diffs) >= big_thresh]
     y_big = y[np.abs(diffs) >= big_thresh]
 
     # draw grid to indicate the "bins"
-    for i in range(0, len(big_lat_edges) - 1):
-        for j in range(0, len(big_lon_edges) - 1):
-            lat0, lat1 = big_lat_edges[i], big_lat_edges[i + 1]
-            lon0, lon1 = big_lon_edges[j], big_lon_edges[j + 1]
+    for i in range(0, len(lat_edges) - 1):
+        for j in range(0, len(lon_edges) - 1):
+            lat0, lat1 = lat_edges[i], lat_edges[i + 1]
+            lon0, lon1 = lon_edges[j], lon_edges[j + 1]
 
             x0, y0 = m(lon0, lat0)
             x1, y1 = m(lon1, lat1)
@@ -287,9 +296,9 @@ def plot_diff_geoloc_circles(diffed_centers_sizes: pd.DataFrame,
     sc = ax.scatter(x,
                     y,
                     c=diffs,
-                    cmap="managua",
+                    cmap="managua_r",
                     s=sizes,
-                    alpha=0.6,
+                    alpha=0.4,
                     marker="o",
                     edgecolors='none',
                     norm=mplcolors.SymLogNorm(10, vmin=vmin, vmax=vmax),
@@ -297,9 +306,10 @@ def plot_diff_geoloc_circles(diffed_centers_sizes: pd.DataFrame,
 
     cax = fig.add_axes([ax.get_position().x1+0.01,ax.get_position().y0,0.02,ax.get_position().height])
 
-    fig.colorbar(sc, label="Frequency difference", cax=cax)
-    ax.set_title(f"Replying targets difference from {date_big} to {date_small}")
-    ax.set_xlabel(f"Anycast data from Frankfurt to {rx_worker_pretty}")
+    cbar = fig.colorbar(sc, label="Frequency difference", cax=cax)
+    cbar.ax.tick_params(labelsize = 16)
+    ax.set_title(f"Replying targets difference from {date_from} to {date_to}", fontsize=20)
+    ax.set_ylabel(f"Anycast data from Frankfurt to {rx_worker_pretty}", fontsize=16)
     fig.savefig(save_path, bbox_inches="tight", dpi=400)
 
 def plotly_geocord_colors(geoloc_manycast_df: pd.DataFrame,
@@ -351,22 +361,20 @@ def plotly_geocord_colors(geoloc_manycast_df: pd.DataFrame,
     fig.write_image(save_path)
 
 def main():
-    analyze_days = [
-
-                    # cm.DataDate(2025, 4, 27),
-                    cm.DataDate(2025, 4, 28),
+    analyze_days = [cm.DataDate(2025, 4, 28),
                     cm.DataDate(2025, 4, 29),
                     cm.DataDate(2025, 4, 30),
                     cm.DataDate(2025, 5, 1),
-                    cm.DataDate(2025, 5, 2),
-                    cm.DataDate(2025, 5, 3)
-                    # ]
-    ]
-
-    # the assumed bigger one should always be first
-    analyze_combinations = [(0, 1), (1,2), (2,3), (3,4), (4,5)]
-
+                    cm.DataDate(2025, 5, 2)]
+                    ]
     # analyze_days = set([cm.DataDate(2025, 4, 30)])
+
+    recv_site_name = "fr-cdg-manycast"
+    recv_site_pretty_name = "Paris"
+    file_recv_name = "cdg"
+
+    # define which differences to plot
+    analyze_combinations = [(0, 1), (1, 2), (2, 3), (3, 4)]
 
     analyze_days_stats = {}
 
@@ -379,7 +387,7 @@ def main():
     # lat=40.416775, long=-3.703790
 
     # define parameters
-    basemap_area = BasemapArea(30, -20, 50, 20)
+    basemap_area = BasemapArea(30, -11, 60, 40)
 
     # world map (almost world like in https://matplotlib.org/basemap/stable/users/merc.html)
     # basemap_area = BasemapArea(-80, -180, 80, 180)
@@ -424,9 +432,9 @@ def main():
 
         centers_sizes, lat_edges, lon_edges = cluster_geoloc_data(manycast_df,
                                                                   basemap_area,
-                                                                  "es-mad-manycast",
-                                                                  lat_bins=16,
-                                                                  lon_bins=24)
+                                                                  recv_site_name,
+                                                                  lat_bins=20,
+                                                                  lon_bins=28)
 
         # save the stats for each date
         analyze_days_stats[date] = (centers_sizes, lat_edges, lon_edges)
@@ -444,8 +452,8 @@ def main():
     for date, (centers_sizes, lat_edges, lon_edges) in analyze_days_stats.items():
         plot_target_geoloc_circles(centers_sizes,
                                    basemap_area,
-                                   "Madrid",
-                                   results_path / f"fra-mad_{repr(date)}.pdf",
+                                   recv_site_pretty_name,
+                                   results_path / f"fra-{file_recv_name}_{repr(date)}.png",
                                    date,
                                    lat_edges,
                                    lon_edges,
@@ -454,21 +462,21 @@ def main():
                                    vmax=vmax)
 
 
-    big_lat_edges = None
-    big_lon_edges = None
+    from_lat_edges = None
+    from_lon_edges = None
 
     sizes_list = []
 
     vmin = None
     vmax = None
 
-    for idx0, idx1 in analyze_combinations:
-        date_big = analyze_days[idx0]
-        date_small = analyze_days[idx1]
-        centers_big, big_lat_edges, big_lon_edges = analyze_days_stats[date_big]
-        centers_small, _, _ = analyze_days_stats[date_small]
+    for idx_from, idx_to in analyze_combinations:
+        date_from = analyze_days[idx_from]
+        date_to = analyze_days[idx_to]
+        centers_from, from_lat_edges, from_lon_edges = analyze_days_stats[date_from]
+        centers_to, _, _ = analyze_days_stats[date_to]
 
-        centers_diffs = calc_diff_in_clusters(centers_big, centers_small)
+        centers_diffs = calc_diff_in_clusters(centers_from, centers_to)
 
         max_cnt = np.max(centers_diffs)
         min_cnt = np.min(centers_diffs)
@@ -480,20 +488,20 @@ def main():
 
         sizes_list.append(centers_diffs)
 
-    for (idx0, idx1), size_diffs in zip(analyze_combinations, sizes_list):
-        date_big = analyze_days[idx0]
-        date_small = analyze_days[idx1]
+    for (idx_from, idx_to), size_diffs in zip(analyze_combinations, sizes_list):
+        date_from = analyze_days[idx_from]
+        date_to = analyze_days[idx_to]
         plot_diff_geoloc_circles(size_diffs,
-                                      basemap_area,
-                                      "Madrid",
-                                      results_path / f"fra-mad_{repr(date_big)}_to_{repr(date_small)}.png",
-                                      date_big,
-                                      date_small,
-                                      big_lat_edges,
-                                      big_lon_edges,
-                                      big_thresh=500,
-                                      vmin=vmin,
-                                      vmax=vmax)
+                                 basemap_area,
+                                 recv_site_pretty_name,
+                                 results_path / f"fra-{file_recv_name}_{repr(date_from)}_to_{repr(date_to)}.png",
+                                 date_from,
+                                 date_to,
+                                 from_lat_edges,
+                                 from_lon_edges,
+                                 big_thresh=500,
+                                 vmin=vmin,
+                                 vmax=vmax)
 
 
     # Load a GeoDataFrame with regional boundaries (e.g., US states, world countries)
